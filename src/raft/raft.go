@@ -185,35 +185,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3, 4).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//currentTerm, _ := rf.GetState()
-	//currentTerm := rf.currentTerm
-	//lastIndex, lastTerm := rf.getLastEntryInfo()
-	/*
-		logUpToDate := func() bool {
-			if lastTerm == args.LastLogTerm {
-				return lastIndex <= args.LastLogIndex
-			}
-			return lastTerm < args.LastLogTerm
-		}()
-	*/
 
 	//reply.Id = rf.id
 	fmt.Println("argument term ", args.Term, " term ", rf.currentTerm, " ME ", rf.me)
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		//} else if args.Term >= currentTerm && logUpToDate {
+
 	} else if args.Term >= rf.currentTerm {
 		rf.transitionToFollower(args.Term)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	}
-	if rf.votedFor == -1 || args.CandidateId == rf.votedFor {
-		//} else if (rf.votedFor == -1) && logUpToDate {
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-	}
+
 	reply.Term = rf.currentTerm
 	rf.persist()
 	//fmt.Printf("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateId, args.Term, logUpToDate, reply.VoteGranted)
@@ -351,7 +335,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) startLeaderElectionProcess() {
 
-	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
+	electionTimeout := func() time.Duration {
 		return (450 + time.Duration(rand.Intn(200))) * time.Millisecond
 	}
 
@@ -360,6 +344,7 @@ func (rf *Raft) startLeaderElectionProcess() {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if !rf.isDecommissioned {
 		// Start election process if we're not a leader and the haven't received a heartbeat for `electionTimeout`
 		//_, isLeader := rf.GetState()
@@ -393,6 +378,7 @@ func (rf *Raft) startElection() {
 	replies := make([]RequestVoteReply, len(rf.peers))
 
 	voteChan := make(chan int, len(rf.peers))
+
 	for i := range rf.peers {
 		if i != rf.me {
 			go rf.sendRequestVoteToServer(i, &args, &replies[i], voteChan)
@@ -453,7 +439,7 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) transitionToCandidate() {
 	//rf.SetStateType(Candidate)
-	fmt.Println("transition to canditate", rf.me)
+	fmt.Println("transition to canditate ", rf.me)
 	rf.state = Candidate
 	// Increment currentTerm and vote for self
 	rf.currentTerm++
