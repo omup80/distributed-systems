@@ -52,9 +52,9 @@ const (
 	Leader    = "Leader"
 )
 
-const HeartBeatInterval = 100 * time.Millisecond
+const HeartBeatInterval = 150 * time.Millisecond
 const CommitApplyIdleCheckInterval = 25 * time.Millisecond
-const LeaderPeerTickInterval = 5 * time.Millisecond
+const LeaderPeerTickInterval = 10 * time.Millisecond
 
 //
 // A Go object implementing a single Raft peer.
@@ -196,26 +196,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return lastTerm < args.LastLogTerm
 		}()
 	*/
-	reply.Term = rf.currentTerm
+
 	//reply.Id = rf.id
 	fmt.Println("argument term ", args.Term, " term ", rf.currentTerm, " ME ", rf.me)
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 		//} else if args.Term >= currentTerm && logUpToDate {
 	} else if args.Term >= rf.currentTerm {
 		rf.transitionToFollower(args.Term)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-	} else if rf.votedFor == -1 || args.CandidateId == rf.votedFor {
+	}
+	if rf.votedFor == -1 || args.CandidateId == rf.votedFor {
 		//} else if (rf.votedFor == -1) && logUpToDate {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-	} else {
-		reply.VoteGranted = false
-
 	}
-
+	reply.Term = rf.currentTerm
 	rf.persist()
 	//fmt.Printf("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateId, args.Term, logUpToDate, reply.VoteGranted)
 }
@@ -251,16 +250,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVoteToServer(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteChan chan int) {
 	//ok := rf.sendRequestVote(server, args, reply)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	fmt.Println("request vode ", ok, server)
+	ok := false
+	for i := 0; i < 3; i++ {
+		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
+		if ok {
+			break
+		}
+	}
+	fmt.Println("request vote ok ", ok, " Server ", server)
 	if ok {
 		voteChan <- server
+	} else {
+		voteChan <- -1
 	}
-	return
+
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := false
+	for i := 0; i < 3; i++ {
+		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+		if ok {
+			break
+		}
+	}
 	return ok
 }
 
@@ -321,13 +334,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	//fmt.Println("Creating Server ", me)
 
 	// Your initialization code here (3, 4).
 	rf.leaderId = -1
 	rf.state = Follower
 	rf.isDecommissioned = false
-	//rf.currentTerm = 0
+	rf.currentTerm = -1
 	rf.votedFor = -1
 	go rf.startLeaderElectionProcess()
 
@@ -340,7 +352,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) startLeaderElectionProcess() {
 
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
-		return (900 + time.Duration(rand.Intn(300))) * time.Millisecond
+		return (450 + time.Duration(rand.Intn(200))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
@@ -351,9 +363,8 @@ func (rf *Raft) startLeaderElectionProcess() {
 	if !rf.isDecommissioned {
 		// Start election process if we're not a leader and the haven't received a heartbeat for `electionTimeout`
 		//_, isLeader := rf.GetState()
-		isLeader := rf.state == Leader
 
-		if !isLeader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
+		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
 			go rf.startElection()
 		}
 		go rf.startLeaderElectionProcess()
@@ -364,25 +375,24 @@ func (rf *Raft) startLeaderElectionProcess() {
 func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
-	fmt.Println("start election")
+	fmt.Println("Election started by ", rf.me)
 	rf.transitionToCandidate()
 
 	// Request votes from peers
-	lastIndex, lastTerm := rf.getLastEntryInfo()
+	//lastIndex, lastTerm := rf.getLastEntryInfo()
 
 	//currentTerm, _ := rf.GetState()
 	//currentTerm := rf.currentTerm
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogTerm:  lastTerm,
-		LastLogIndex: lastIndex,
+		LastLogTerm:  0,
+		LastLogIndex: 0,
 	}
 
 	replies := make([]RequestVoteReply, len(rf.peers))
 
 	voteChan := make(chan int, len(rf.peers))
-
 	for i := range rf.peers {
 		if i != rf.me {
 			go rf.sendRequestVoteToServer(i, &args, &replies[i], voteChan)
@@ -392,31 +402,42 @@ func (rf *Raft) startElection() {
 	rf.mu.Unlock()
 
 	// Count votes from peers as they come in
-	fmt.Println("counting started")
+	//fmt.Println("counting started")
 	//fmt.Println("len(replies)", len(replies))
 
+	//rf.mu.Lock()
 	votes := 1
-	for i := 0; i < len(replies); i++ {
+	i := 0
+	for ; i < len(rf.peers)-1; i++ {
 		//serverReplied := <-voteChan
 		//reply := replies[<-voteChan]
 		//fmt.Println("server replied ", serverReplied)
-		reply := replies[<-voteChan]
+
+		server := <-voteChan
+		if server == -1 {
+			continue
+		}
+
+		reply := replies[server]
 		rf.mu.Lock()
 
 		// §5.1: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		votes += reply.VoteCount()
 		if reply.Term > rf.currentTerm {
 			rf.transitionToFollower(reply.Term)
+			//rf.mu.Unlock()
 			break
-		} else if votes > len(replies)/2 { // Has majority vote
+		} else if votes > len(rf.peers)/2 { // Has majority vote
 			// Ensure that we're still a candidate and that another election did not interrupt
-
+			//fmt.Println("Has Majority vote", rf.me)
 			if rf.state == Candidate && args.Term == rf.currentTerm {
 				fmt.Println("Election won. Vote: ", votes, " peers :", len(rf.peers), " me", rf.me, "term ", rf.currentTerm)
 				go rf.promoteToLeader()
+				//rf.mu.Unlock()
 				break
 			} else {
-				fmt.Println("Election for term ", args.Term)
+				fmt.Println("Election for term ended", args.Term)
+				//rf.mu.Unlock()
 				break
 			}
 		}
@@ -424,7 +445,10 @@ func (rf *Raft) startElection() {
 	}
 
 	rf.persist()
-	rf.mu.Unlock()
+	if i != len(rf.peers)-1 {
+		rf.mu.Unlock()
+	}
+
 }
 
 func (rf *Raft) transitionToCandidate() {
@@ -445,6 +469,9 @@ func (rf *Raft) getLastEntryInfo() (int, int) {
 
 func (rf *Raft) transitionToFollower(newTerm int) {
 	//rf.SetStateType(Follower)
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+
 	fmt.Println("transition to Follower", rf.me)
 
 	rf.state = Follower
@@ -457,34 +484,36 @@ func (rf *Raft) promoteToLeader() {
 	defer rf.mu.Unlock()
 
 	rf.state = Leader
-
+	rf.leaderId = rf.me
 	//rf.SetStateType(Leader)
-
+	fmt.Println("Promoted to Leader", rf.me)
 	//rf.nextIndex = make([]int, len(rf.peers))
 	//rf.matchIndex = make([]int, len(rf.peers))
-	rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
+	//rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
 
 	for i := range rf.peers {
 		if i != rf.me {
 			//rf.nextIndex[i] = len(rf.log) + 1 // Should be initialized to leader's last log index + 1
 			//rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
-			rf.sendAppendChan[i] = make(chan struct{}, 1)
+			//rf.sendAppendChan[i] = make(chan struct{}, 1)
 
 			// Start routines for each peer which will be used to monitor and send log entries
-			go rf.startLeaderPeerProcess(i, rf.sendAppendChan[i])
+			go rf.startLeaderPeerProcess(i)
 		}
 	}
 
 }
 
-func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct{}) {
+func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
 	ticker := time.NewTicker(LeaderPeerTickInterval)
 
 	// Initial heartbeat
-	rf.sendAppendEntries(peerIndex, sendAppendChan)
+	fmt.Println("Leader peer process started", rf.state, " Me", rf.me)
+	rf.sendAppendEntries(peerIndex)
 	lastEntrySent := time.Now()
 
 	for {
+
 		rf.mu.Lock()
 		if rf.state != Leader || rf.isDecommissioned {
 			ticker.Stop()
@@ -493,15 +522,12 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct
 		}
 		rf.mu.Unlock()
 
-		select {
-		case <-sendAppendChan: // Signal that we should send a new append to this peer
+		currentTime := <-ticker.C //  send a heartbeat
+		if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
+			fmt.Println("Communicating continuously", rf.state, " Me", rf.me)
+
 			lastEntrySent = time.Now()
-			rf.sendAppendEntries(peerIndex, sendAppendChan)
-		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
-			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
-				lastEntrySent = time.Now()
-				rf.sendAppendEntries(peerIndex, sendAppendChan)
-			}
+			rf.sendAppendEntries(peerIndex)
 		}
 
 	}
@@ -521,20 +547,13 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
+func (rf *Raft) sendAppendEntries(peerIndex int) {
 
 	rf.mu.Lock()
 
-	if rf.state == Leader || rf.isDecommissioned {
+	if rf.state != Leader || rf.isDecommissioned {
 		rf.mu.Unlock()
 		return
-	}
-	var prevLogIndex, prevLogTerm int
-	if len(rf.log) > 0 {
-		lastEntry := rf.log[len(rf.log)-1]
-		prevLogIndex, prevLogTerm = len(rf.log)-1, lastEntry.Term
-	} else {
-		prevLogIndex, prevLogTerm = 0, 0
 	}
 
 	var entries []Log = []Log{}
@@ -543,8 +562,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
 		Entries:      entries,
 		LeaderCommit: rf.commitIndex,
 	}
@@ -563,21 +582,28 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			fmt.Println("Successful heartbeat from ", peerIndex)
 
 		}
-	} else {
-		if reply.Term > rf.currentTerm {
-			//fmt.Println("Switching to follower as %s's term is %d", rf, peerIndex, reply.Term)
-			fmt.Println("Switching to follower ", reply.Term)
-
-			rf.transitionToFollower(reply.Term)
-		}
 	}
+
+	if !reply.Success && reply.Term > rf.currentTerm {
+		//fmt.Println("Switching to follower as %s's term is %d", rf, peerIndex, reply.Term)
+		fmt.Println("Switching to follower ", reply.Term)
+
+		rf.transitionToFollower(reply.Term)
+	}
+
 	rf.persist()
 
 }
 
 func (rf *Raft) sendAppendEntryRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := false
+	for i := 0; i < 3; i++ {
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		if ok {
+			break
+		}
+		//fmt.Println("Server ", rf.me, " doing heartbeat to ", server, " failed ", i , " time")
+	}
 
 	return ok
 }
@@ -585,11 +611,12 @@ func (rf *Raft) sendAppendEntryRequest(server int, args *AppendEntriesArgs, repl
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//fmt.Println("Append from server",args.LeaderId)
+	fmt.Println("Append from server", args.LeaderId)
 	//RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 	//currentTerm, _ := rf.GetState()
-	reply.Term = rf.currentTerm
+
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	} else if args.Term >= rf.currentTerm {
@@ -601,6 +628,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastHeartBeat = time.Now()
 	}
 
+	reply.Success = true
+	reply.Term = rf.currentTerm
 	// Try to find supplied previous log entry match in our log
 
 	rf.persist()
