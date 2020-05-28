@@ -196,6 +196,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.changeStateToFollower(args.Term)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+	} else if rf.votedFor == -1 || args.CandidateId == rf.votedFor {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
 	}
 
 	reply.Term = rf.currentTerm
@@ -332,7 +335,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) startLeaderElectionProcess() {
 
 	timeOutForElection := func() time.Duration {
-		return (300 + time.Duration(rand.Intn(200))) * time.Millisecond
+		return (350 + time.Duration(rand.Intn(200))) * time.Millisecond
 	}
 
 	reElectionTimeOut := timeOutForElection()
