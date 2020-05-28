@@ -17,7 +17,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -52,7 +51,7 @@ const (
 	Leader    = "Leader"
 )
 
-const HeartBeatInterval = 150 * time.Millisecond
+const HeartBeatInterval = 100 * time.Millisecond
 const CommitApplyIdleCheckInterval = 25 * time.Millisecond
 const LeaderPeerTickInterval = 10 * time.Millisecond
 
@@ -170,7 +169,7 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (reply RequestVoteReply) VoteCount() int {
+func (reply *RequestVoteReply) VoteCount() int {
 
 	if reply.VoteGranted {
 		return 1
@@ -187,12 +186,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	//reply.Id = rf.id
-	fmt.Println("argument term ", args.Term, " term ", rf.currentTerm, " ME ", rf.me)
+	//fmt.Println("argument term ", args.Term, " term ", rf.currentTerm, " ME ", rf.me)
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 
-	} else if args.Term >= rf.currentTerm {
+	} else if args.Term == rf.currentTerm && rf.votedFor != args.CandidateId {
+
+		reply.VoteGranted = false
+	} else if args.Term > rf.currentTerm {
 		rf.transitionToFollower(args.Term)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -241,7 +243,7 @@ func (rf *Raft) sendRequestVoteToServer(server int, args *RequestVoteArgs, reply
 			break
 		}
 	}
-	fmt.Println("request vote ok ", ok, " Server ", server)
+	//fmt.Println("Vote Request to", server, " status " , ok)
 	if ok {
 		voteChan <- server
 	} else {
@@ -336,7 +338,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) startLeaderElectionProcess() {
 
 	electionTimeout := func() time.Duration {
-		return (450 + time.Duration(rand.Intn(200))) * time.Millisecond
+		return (300 + time.Duration(rand.Intn(200))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
@@ -360,7 +362,7 @@ func (rf *Raft) startLeaderElectionProcess() {
 func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
-	fmt.Println("Election started by ", rf.me)
+	//fmt.Println("Election started by ", rf.me)
 	rf.transitionToCandidate()
 
 	// Request votes from peers
@@ -417,12 +419,12 @@ func (rf *Raft) startElection() {
 			// Ensure that we're still a candidate and that another election did not interrupt
 			//fmt.Println("Has Majority vote", rf.me)
 			if rf.state == Candidate && args.Term == rf.currentTerm {
-				fmt.Println("Election won. Vote: ", votes, " peers :", len(rf.peers), " me", rf.me, "term ", rf.currentTerm)
+				//fmt.Println("Election won. Vote: ", votes, " peers :", len(rf.peers), " me", rf.me, "term ", rf.currentTerm)
 				go rf.promoteToLeader()
 				//rf.mu.Unlock()
 				break
 			} else {
-				fmt.Println("Election for term ended", args.Term)
+				//fmt.Println("Election for term ended", args.Term)
 				//rf.mu.Unlock()
 				break
 			}
@@ -439,7 +441,7 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) transitionToCandidate() {
 	//rf.SetStateType(Candidate)
-	fmt.Println("transition to canditate ", rf.me)
+	//fmt.Println("transition to canditate ", rf.me)
 	rf.state = Candidate
 	// Increment currentTerm and vote for self
 	rf.currentTerm++
@@ -455,10 +457,8 @@ func (rf *Raft) getLastEntryInfo() (int, int) {
 
 func (rf *Raft) transitionToFollower(newTerm int) {
 	//rf.SetStateType(Follower)
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
 
-	fmt.Println("transition to Follower", rf.me)
+	//fmt.Println("transition to Follower", rf.me)
 
 	rf.state = Follower
 	rf.currentTerm = newTerm
@@ -472,7 +472,7 @@ func (rf *Raft) promoteToLeader() {
 	rf.state = Leader
 	rf.leaderId = rf.me
 	//rf.SetStateType(Leader)
-	fmt.Println("Promoted to Leader", rf.me)
+	//fmt.Println("Promoted to Leader", rf.me)
 	//rf.nextIndex = make([]int, len(rf.peers))
 	//rf.matchIndex = make([]int, len(rf.peers))
 	//rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
@@ -494,7 +494,7 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
 	ticker := time.NewTicker(LeaderPeerTickInterval)
 
 	// Initial heartbeat
-	fmt.Println("Leader peer process started", rf.state, " Me", rf.me)
+	//fmt.Println("Leader peer process started", rf.state, " Me", rf.me)
 	rf.sendAppendEntries(peerIndex)
 	lastEntrySent := time.Now()
 
@@ -510,7 +510,7 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
 
 		currentTime := <-ticker.C //  send a heartbeat
 		if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
-			fmt.Println("Communicating continuously", rf.state, " Me", rf.me)
+			//fmt.Println("Communicating continuously", rf.state, " Me", rf.me)
 
 			lastEntrySent = time.Now()
 			rf.sendAppendEntries(peerIndex)
@@ -551,28 +551,29 @@ func (rf *Raft) sendAppendEntries(peerIndex int) {
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
 		Entries:      entries,
-		LeaderCommit: rf.commitIndex,
+		LeaderCommit: 0,
 	}
 	rf.mu.Unlock()
 	ok := rf.sendAppendEntryRequest(peerIndex, &args, &reply)
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if !ok {
-		fmt.Println("Me ", rf.me, " Communication error: AppendEntries() RPC failed", peerIndex)
-	} else if rf.state != Leader || rf.isDecommissioned || args.Term != rf.currentTerm {
-		fmt.Println("Node state has changed since request was sent. Discarding response", rf.me)
+		//fmt.Println("Me ", rf.me, " Communication error: AppendEntries() RPC failed", peerIndex)
+	} else if rf.state != Leader || args.Term != rf.currentTerm {
+		//fmt.Println("Node state has changed since request was sent. Discarding response", rf.me)
 	} else if reply.Success {
 		if len(entries) > 0 {
 			//append entries later
 		} else {
 			//fmt.Println("Successful heartbeat from %s", rf, peerIndex)
-			fmt.Println("Successful heartbeat from ", peerIndex)
+			//fmt.Println("Successful heartbeat from ", peerIndex)
 
 		}
 	}
 
 	if !reply.Success && reply.Term > rf.currentTerm {
 		//fmt.Println("Switching to follower as %s's term is %d", rf, peerIndex, reply.Term)
-		fmt.Println("Switching to follower ", reply.Term)
+		//fmt.Println("Switching to follower ", reply.Term)
 
 		rf.transitionToFollower(reply.Term)
 	}
@@ -597,7 +598,7 @@ func (rf *Raft) sendAppendEntryRequest(server int, args *AppendEntriesArgs, repl
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Println("Append from server", args.LeaderId)
+	//fmt.Println("Append from server", args.LeaderId)
 	//RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 	//currentTerm, _ := rf.GetState()
 
@@ -605,9 +606,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
-	} else if args.Term >= rf.currentTerm {
+	} else if args.Term > rf.currentTerm {
 		rf.transitionToFollower(args.Term)
 		rf.leaderId = args.LeaderId
+		reply.Success = true
+
+	} else if args.Term == rf.currentTerm {
+		rf.votedFor = -1
+		reply.Success = true
 	}
 	//fmt.Println("leader Id", rf.leaderId, "Argument Leader Id", args.LeaderId)
 	if rf.leaderId == args.LeaderId {
