@@ -56,7 +56,7 @@ const (
 
 const HeartBeatInterval = 100 * time.Millisecond
 const LeaderPeerTickInterval = 10 * time.Millisecond
-const CommitApplyIdleCheckInterval = 25 * time.Millisecond
+const commitIdleInterval = 25 * time.Millisecond
 
 //
 // A Go object implementing a single Raft peer.
@@ -88,9 +88,9 @@ type Raft struct {
 	leaderId int
 
 	//additional
-	lastHeartBeat  time.Time
-	state          string
-	sendAppendChan []chan struct{}
+	lastHeartBeat    time.Time
+	state            string
+	appendSignalChan []chan struct{}
 }
 
 //
@@ -194,7 +194,7 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (reply *RequestVoteReply) VoteCount() int {
+func (reply *RequestVoteReply) countVote() int {
 
 	if reply.VoteGranted {
 		return 1
@@ -212,7 +212,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//reply.Id = rf.id
 	//fmt.Println("argument term ", args.Term, " term ", rf.currentTerm, " ME ", rf.me)
-	lastIndex, lastTerm := rf.getLastEntryInfo()
+	lastIndex, lastTerm := rf.fetchDetailOfLastEntry()
 
 	logUpToDate := func() bool {
 		if lastTerm == args.LastLogTerm {
@@ -282,6 +282,7 @@ func (rf *Raft) sendRequestVoteToServer(server int, args *RequestVoteArgs, reply
 			break
 		}
 	}
+
 	successChan <- ok
 
 }
@@ -347,18 +348,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	//fmt.Println("Inside start ", rf.me)
 
-	nextIndex := func() int {
+	//function to give index of  log entry
+	index := func() int {
 		if len(rf.log) > 0 {
 			return rf.log[len(rf.log)-1].Index + 1
 		}
 		return 1
 	}()
 
-	entry := Log{Index: nextIndex, Term: rf.currentTerm, Command: command}
+	entry := Log{Index: index, Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, entry)
 	//fmt.Println("New entry appended to leader's log: ", entry)
 
-	return nextIndex, term, isLeader
+	return index, term, isLeader
 }
 
 //
@@ -403,48 +405,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	go rf.startLocalApplyProcess(applyCh)
+	go rf.applyLog(applyCh)
 
 	return rf
 }
-func (rf *Raft) findLogIndex(logIndex int) (int, bool) {
-	for i, e := range rf.log {
-		if e.Index == logIndex {
-			return i, true
-		}
-	}
-	return -1, false
-}
 
-func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
-	rf.mu.Lock()
+func (rf *Raft) applyLog(applyChan chan ApplyMsg) {
+	//rf.mu.Lock()
 	//fmt.Println("Starting commit process -  ", rf.me," Last log applied: " ,rf.lastApplied)
 
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 
 	for {
 		rf.mu.Lock()
 
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
 
-			//startIndex, _ := rf.findLogIndex(rf.lastApplied + 1)
-			//startIndex = Max(startIndex, 0)
-			startIndex := rf.lastApplied
-			endIndex := -1
-			for i := startIndex; i < len(rf.log); i++ {
+			startLogIndex := rf.lastApplied
+			endLogIndex := -1
+			for i := startLogIndex; i < len(rf.log); i++ {
 				if rf.log[i].Index <= rf.commitIndex {
-					endIndex = i
+					endLogIndex = i
 				}
 			}
 
-			if endIndex >= 0 { // We have some entries to locally commit
-				entries := make([]Log, endIndex-startIndex+1)
-				copy(entries, rf.log[startIndex:endIndex+1])
+			if endLogIndex >= 0 {
+				entries := make([]Log, endLogIndex-startLogIndex+1)
+				copy(entries, rf.log[startLogIndex:endLogIndex+1])
 
 				rf.mu.Unlock()
 
-				for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
-					applyChan <- ApplyMsg{CommandIndex: v.Index, Command: v.Command, CommandValid: true}
+				for _, entry := range entries {
+					applyChan <- ApplyMsg{CommandIndex: entry.Index, Command: entry.Command, CommandValid: true}
 				}
 
 				rf.mu.Lock()
@@ -454,7 +446,7 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 		} else {
 			rf.mu.Unlock()
-			<-time.After(CommitApplyIdleCheckInterval)
+			<-time.After(commitIdleInterval)
 		}
 	}
 }
@@ -482,7 +474,7 @@ func (rf *Raft) startLeaderElectionProcess() {
 
 }
 
-func (rf *Raft) getLastEntryInfo() (int, int) {
+func (rf *Raft) fetchDetailOfLastEntry() (int, int) {
 	if len(rf.log) > 0 {
 		entry := rf.log[len(rf.log)-1]
 		return entry.Index, entry.Term
@@ -498,7 +490,7 @@ func (rf *Raft) startElection() {
 	rf.lastHeartBeat = time.Now()
 
 	// Request votes from peers
-	lastIndex, lastTerm := rf.getLastEntryInfo()
+	lastIndex, lastTerm := rf.fetchDetailOfLastEntry()
 
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -526,12 +518,19 @@ func (rf *Raft) startElection() {
 	for ; i < len(rf.peers); i++ {
 
 		server := <-votingChannel
+		rf.mu.Lock()
+
 		if server == -1 {
+			if i == len(rf.peers)-1 {
+				rf.persist()
+
+			}
+			rf.mu.Unlock()
 			continue
+
 		}
 
 		reply := votingReplies[server]
-		rf.mu.Lock()
 
 		if reply.Term > rf.currentTerm {
 			rf.changeStateToFollower(reply.Term)
@@ -539,8 +538,7 @@ func (rf *Raft) startElection() {
 			rf.persist()
 
 			break
-		} else if votes += reply.VoteCount(); votes > len(rf.peers)/2 { // Has majority vote
-			// Ensure that we're still a candidate and that another election did not interrupt
+		} else if votes += reply.countVote(); votes > len(rf.peers)/2 { // Has majority vote
 			//fmt.Println("Has Majority vote", rf.me)
 			flag = true
 			if rf.state == Candidate && args.Term == rf.currentTerm {
@@ -598,76 +596,33 @@ func (rf *Raft) changeStateToFollower(newTerm int) {
 func (rf *Raft) promoteToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//fmt.Println("Inside promote to leader ", rf.me, " term ", rf.currentTerm)
 
 	rf.state = Leader
 	rf.leaderId = rf.me
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
+	rf.appendSignalChan = make([]chan struct{}, len(rf.peers))
 
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.nextIndex[i] = len(rf.log) + 1 // Should be initialized to leader's last log index + 1
-			rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
-			rf.sendAppendChan[i] = make(chan struct{}, 1)
+			rf.nextIndex[i] = len(rf.log) + 1
+			rf.matchIndex[i] = 0
 
-			// Start routines for each peer which will be used to monitor and send log entries
-			go rf.startLeaderPeerInteractionProcess(i, rf.sendAppendChan[i])
+			rf.appendSignalChan[i] = make(chan struct{}, 1)
+
+			go rf.startLeaderPeerInteractionProcess(i, rf.appendSignalChan[i])
 		}
 	}
 
 }
 
-/*func (rf *Raft) startLeaderPeerInteractionProcess(peerIndex int, sendAppendChan chan struct{}) {
+func (rf *Raft) startLeaderPeerInteractionProcess(peerIndex int, appendSignalChan chan struct{}) {
 	timer := time.NewTicker(LeaderPeerTickInterval)
 
-	// Initial heartbeat
-	//fmt.Println("Leader peer process started", rf.state, " Me", rf.me)
-	rf.sendAppendEntries(peerIndex, sendAppendChan)
-	lastHeartBeatSent := time.Now()
-
-	for {
-
-		rf.mu.Lock()
-		if rf.state != Leader {
-			timer.Stop()
-			rf.mu.Unlock()
-			break
-		}
-		rf.mu.Unlock()
-
-		select {
-		case <-sendAppendChan: // Signal that we should send a new append to this peer
-			lastHeartBeatSent = time.Now()
-			rf.sendAppendEntries(peerIndex, sendAppendChan)
-		case currentTime := <-timer.C: // If traffic has been idle, we should send a heartbeat
-			fmt.Println("Inside heartbeat", rf.me)
-			if currentTime.Sub(lastHeartBeatSent) >= HeartBeatInterval {
-				lastHeartBeatSent = time.Now()
-				rf.sendAppendEntries(peerIndex, sendAppendChan)
-			}
-		}
-
-		//currentTime := <-timer.C //  send a heartbeat
-		//if currentTime.Sub(lastHeartBeatSent) >= HeartBeatInterval {
-
-		//	lastHeartBeatSent = time.Now()
-		//rf.sendAppendEntries(peerIndex)
-		//}
-
-	}
-}
-*/
-
-func (rf *Raft) startLeaderPeerInteractionProcess(peerIndex int, sendAppendChan chan struct{}) {
-	timer := time.NewTicker(LeaderPeerTickInterval)
-
-	// Initial heartbeat
 	//fmt.Println("Leader peer process started", rf.state, " Me", rf.me)
 
-	rf.sendAppendEntries(peerIndex, sendAppendChan)
+	rf.sendAppendEntries(peerIndex, appendSignalChan)
 	lastHeartBeatSent := time.Now()
 
 	for {
@@ -681,23 +636,25 @@ func (rf *Raft) startLeaderPeerInteractionProcess(peerIndex int, sendAppendChan 
 		rf.mu.Unlock()
 		//fmt.Println("Inside for loop append", rf.me)
 
+		//whenever get a append signal then send append entry
+		//when doing nothing then send heartbeat in fixed interval
 		select {
-		case <-sendAppendChan: // Signal that we should send a new append to this peer
+		case <-appendSignalChan:
 			lastHeartBeatSent = time.Now()
-			rf.sendAppendEntries(peerIndex, sendAppendChan)
-		case currentTime := <-timer.C: // If traffic has been idle, we should send a heartbeat
-			if currentTime.Sub(lastHeartBeatSent) >= HeartBeatInterval {
+			rf.sendAppendEntries(peerIndex, appendSignalChan)
+		case now := <-timer.C:
+			if now.Sub(lastHeartBeatSent) >= HeartBeatInterval {
 				//fmt.Println("Inside heartbeat", rf.me)
 
 				lastHeartBeatSent = time.Now()
-				rf.sendAppendEntries(peerIndex, sendAppendChan)
+				rf.sendAppendEntries(peerIndex, appendSignalChan)
 				//fmt.Println("After heartbeat", rf.me)
 
 			}
 		}
 
-		//currentTime := <-timer.C //  send a heartbeat
-		//if currentTime.Sub(lastHeartBeatSent) >= HeartBeatInterval {
+		//now := <-timer.C //  send a heartbeat
+		//if now.Sub(lastHeartBeatSent) >= HeartBeatInterval {
 
 		//	lastHeartBeatSent = time.Now()
 		//rf.sendAppendEntries(peerIndex)
@@ -716,13 +673,13 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term                int
-	Success             bool
-	ConflictingLogTerm  int // Term of the conflicting entry, if any
-	ConflictingLogIndex int // First index of the log for the above conflicting term
+	Term             int
+	Success          bool
+	ConflictingTerm  int // Term of the conflicting entry, if any
+	ConflictingIndex int // First index of the log for the above conflicting term
 }
 
-func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
+func (rf *Raft) sendAppendEntries(peerIndex int, appendSignalChan chan struct{}) {
 
 	rf.mu.Lock()
 
@@ -732,16 +689,16 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	}
 
 	var entries []Log = []Log{}
-	var prevLogIndex, prevLogTerm int = 0, 0
-	lastLogIndex, _ := rf.getLastEntryInfo()
+	var previousLogIndex, previousLogTerm int = 0, 0
+	lastLogIndex, _ := rf.fetchDetailOfLastEntry()
 
 	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
 
-		for i, v := range rf.log { // Need to send logs beginning from index `rf.nextIndex[peerIndex]`
+		for i, v := range rf.log {
 			if v.Index == rf.nextIndex[peerIndex] {
 				if i > 0 {
 					lastEntry := rf.log[i-1]
-					prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+					previousLogIndex, previousLogTerm = lastEntry.Index, lastEntry.Term
 				}
 				entries = make([]Log, len(rf.log)-i)
 				copy(entries, rf.log[i:])
@@ -750,10 +707,10 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 		}
 		//fmt.Println("Sending log entries of length", len(entries)," to ", peerId)
 
-	} else { // We're just going to send a heartbeat
+	} else {
 		if len(rf.log) > 0 {
 			lastEntry := rf.log[len(rf.log)-1]
-			prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+			previousLogIndex, previousLogTerm = lastEntry.Index, lastEntry.Term
 		}
 
 	}
@@ -762,8 +719,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: previousLogIndex,
+		PrevLogTerm:  previousLogTerm,
 		LeaderCommit: rf.commitIndex,
 		Entries:      entries,
 	}
@@ -777,50 +734,47 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !ok {
-		//fmt.Println("Me ", rf.me, " Communication error: AppendEntries() RPC failed", peerIndex)
+		//fmt.Println("Me ", rf.me, " no response", peerIndex)
 	} else if reply.Term > rf.currentTerm {
 		//fmt.Println("Switching to follower as in append", peerIndex," " ,reply.Term)
 
 		rf.changeStateToFollower(reply.Term)
 	} else if rf.state != Leader || reply.Term != rf.currentTerm {
-		//fmt.Println("Node state has changed it's state since request was sent. Discarding response", rf.me)
+		//fmt.Println("Do nothing for this condition")
 	} else if reply.Success {
 		if len(entries) > 0 {
 			lastReplicated := entries[len(entries)-1]
 			rf.matchIndex[peerIndex] = lastReplicated.Index
 			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
-			rf.updateCommitIndex()
+			rf.handleCommitIndexModification()
 		} else {
-			//fmt.Prinl("Successful heartbeat from ", peerId)
+
 		}
 	} else {
 
-		// Log deviation, we should go back to `ConflictingLogIndex - 1`, lowest value for nextIndex[peerIndex] is 1.
-		rf.nextIndex[peerIndex] = Max(reply.ConflictingLogIndex-1, 1)
-		sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
+		rf.nextIndex[peerIndex] = FindMax(reply.ConflictingIndex-1, 1)
+		appendSignalChan <- struct{}{}
 
 	}
 
 	rf.persist()
 
 }
-func Max(x, y int) int {
+func FindMax(x, y int) int {
 	if x > y {
 		return x
 	}
 	return y
 }
 
-func (rf *Raft) updateCommitIndex() {
-	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+func (rf *Raft) handleCommitIndexModification() {
 	for i := len(rf.log) - 1; i >= 0; i-- {
 		if v := rf.log[i]; v.Term == rf.currentTerm && v.Index > rf.commitIndex {
-			replicationCount := 1
+			count := 1
 			for j := range rf.peers {
 				if j != rf.me && rf.matchIndex[j] >= v.Index {
-					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						//fmt.Println("Updating commit index ", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
-						rf.commitIndex = v.Index // Set index of this entry as new commit index
+					if count++; count > len(rf.peers)/2 {
+						rf.commitIndex = v.Index
 						break
 					}
 				}
@@ -874,17 +828,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	} else {
-
-		//else if args.Term >= rf.currentTerm  && rf.state==Leader{
 		rf.changeStateToFollower(args.Term)
 		rf.leaderId = args.LeaderId
 		rf.lastHeartBeat = time.Now()
 
 	}
-
-	//if rf.leaderId == args.LeaderId {
-	//	rf.lastHeartBeat = time.Now()
-	//}
 
 	previousLogIndex := -1
 	for i, v := range rf.log {
@@ -893,7 +841,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				previousLogIndex = i
 				break
 			} else {
-				reply.ConflictingLogTerm = v.Term
+				reply.ConflictingTerm = v.Term
 			}
 		}
 	}
@@ -906,12 +854,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for i := previousLogIndex + 1; i < len(rf.log); i++ {
 
 			entryConsistent := func() bool {
-				localEntry, leadersEntry := rf.log[i], args.Entries[indexOfEntries]
-				return localEntry.Index == leadersEntry.Index && localEntry.Term == leadersEntry.Term
+				myEntry, receivedEntry := rf.log[i], args.Entries[indexOfEntries]
+				return myEntry.Index == receivedEntry.Index && myEntry.Term == receivedEntry.Term
 			}
 
 			if indexOfEntries >= len(args.Entries) || !entryConsistent() {
-				// Additional entries must be inconsistent, so let's delete them from our local log
 				rf.log = rf.log[:i]
 				break
 			} else {
@@ -920,37 +867,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		}
 
-		// Append all entries that are not already in our log
 		if indexOfEntries < len(args.Entries) {
 			rf.log = append(rf.log, args.Entries[indexOfEntries:]...)
 		}
 
-		// Update the commit index
 		if args.LeaderCommit > rf.commitIndex {
-			var latestLogIndex = 0
+			var lastNewIndex = 0
 			if len(rf.log) > 0 {
-				latestLogIndex = rf.log[len(rf.log)-1].Index
+				lastNewIndex = rf.log[len(rf.log)-1].Index
 			}
 
-			if args.LeaderCommit < latestLogIndex {
+			if args.LeaderCommit < lastNewIndex {
 				rf.commitIndex = args.LeaderCommit
 			} else {
-				rf.commitIndex = latestLogIndex
+				rf.commitIndex = lastNewIndex
 			}
 		}
 		reply.Success = true
 	} else {
-		// §5.3: When rejecting an AppendEntries request, the follower can include the term of the
-		//	 	 conflicting entry and the first index it stores for that term.
 
-		// If there's no entry with `args.PreviousLogIndex` in our log. Set conflicting term to that of last log entry
-		if reply.ConflictingLogTerm == 0 && len(rf.log) > 0 {
-			reply.ConflictingLogTerm = rf.log[len(rf.log)-1].Term
+		if reply.ConflictingTerm == 0 && len(rf.log) > 0 {
+			reply.ConflictingTerm = rf.log[len(rf.log)-1].Term
 		}
 
-		for _, v := range rf.log { // Find first log index for the conflicting term
-			if v.Term == reply.ConflictingLogTerm {
-				reply.ConflictingLogIndex = v.Index
+		for _, v := range rf.log {
+			if v.Term == reply.ConflictingTerm {
+				reply.ConflictingIndex = v.Index
 				break
 			}
 		}
